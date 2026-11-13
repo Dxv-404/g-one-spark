@@ -290,10 +290,16 @@ def cards_eligible(
     if not identical:
         return False, "not bit-identical across cards"
     per = r["gpu"].get("per_card") or {}
-    if not per or gpu_total_mib is None:
+    if not per:
+        return False, "no per-card GPU reading"
+    if gpu_total_mib is None and all(c.get("mem_used_mib_max") is None for c in per.values()):
+        return True, "eligible (these GPUs report no memory; the host memory rule applies, D-096)"
+    if gpu_total_mib is None:
         return False, "no per-card GPU memory reading"
     for i, c in per.items():
-        free = (gpu_total_mib - c.get("mem_used_mib_max", float("inf"))) / 1024
+        if c.get("mem_used_mib_max") is None:
+            return False, f"card {i} has no memory reading"
+        free = (gpu_total_mib - c["mem_used_mib_max"]) / 1024
         if free < gpu_headroom_gib:
             return False, f"card {i} peak left {free:.1f} GiB free, under {gpu_headroom_gib:.0f}"
     return True, "eligible"
@@ -371,6 +377,10 @@ def eligible(
         return False, "not bit-identical"
     if not h["clean"]:
         return False, "background changed (not clean)"
+    # D-096: a GPU that NEVER reports memory (the reference had no total and the round no peak) shares the host's
+    # memory, which next_step's host rule guards. A missing reading on a GPU that does report one still blocks.
+    if gpu_total_mib is None and h.get("peak_gpu_mib") is None:
+        return True, "eligible (this GPU reports no memory; the host memory rule applies)"
     if gpu_total_mib is None or h.get("peak_gpu_mib") is None:
         return False, "no GPU memory reading"
     free = (gpu_total_mib - h["peak_gpu_mib"]) / 1024
@@ -542,7 +552,7 @@ def run_round(
     tp = aggregate_throughput(len(seeds), generations, release, ends) if ends and not failed else float("nan")
     log(
         f"    N = {len(seeds)}: {'FAILED' if failed else 'ran'}, aggregate {tp:.3f} gen/s, peak GPU "
-        f"{gpu.get('mem_used_mib_max', float('nan')):.0f} MiB, util mean {gpu.get('util_mean', float('nan')):.0f}"
+        f"{gpu.get('mem_used_mib_max') or float('nan'):.0f} MiB, util mean {gpu.get('util_mean', float('nan')):.0f}"
     )
     return {
         "workers": workers,
@@ -622,7 +632,7 @@ def main(argv=None) -> int:
     reference = s1.background_load()
     log(
         f"BACKGROUND GPU LOAD before anything of ours: {reference.get('util_mean', float('nan')):.0f} percent mean, "
-        f"{reference.get('util_max', float('nan')):.0f} peak, {reference.get('mem_used_mib_mean', float('nan')):.0f} MiB "
+        f"{reference.get('util_max', float('nan')):.0f} peak, {reference.get('mem_used_mib_mean') or float('nan'):.0f} MiB "
         "used. This is whatever else is on the GPU (the desktop, any other job); every round is compared with it."
     )
     gpu_total = reference.get("mem_total_mib")

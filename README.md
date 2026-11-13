@@ -9,8 +9,8 @@ packages: the experiment code is byte-identical, only the operator documents dif
 **Nobody needs to change any file to run it, and nobody should.** The run scripts refuse to start if a shipped file
 has been edited. The scripts live under `scripts/a6000/` for historical reasons; they are not specific to that card.
 
-    source commit     61c1fa80a3cd8ddb2fa0d8311cbe30956db2599d
-    verified commit   fb6388c23ec12d366709e8f481d85842508577ee   the run code is byte-identical to this commit, which passed
+    source commit     2c848655c9828b375dba7bd398cbd1331982e33b
+    verified commit   f44d3efbda3eccb6b03eff5246a1bfa64b20ec06   the run code is byte-identical to this commit, which passed
                                            the full differential test tier (on x86; this machine is ARM)
 
 **Read `OPERATOR-GUIDE.md`.** It is the step-by-step walkthrough for this machine, including what is different about

@@ -37,18 +37,27 @@ CLEAN_MEM_MARGIN_GIB = 1.0
 _QUERY = "utilization.gpu,memory.used,memory.total,temperature.gpu"
 
 
-def parse_nvidia_smi(text: str) -> dict | None:
-    """The first parseable `nvidia-smi --query-gpu=<_QUERY> --format=csv,noheader,nounits` line, or None.
+def _field(x: str) -> float | None:
+    """One nvidia-smi field, or None where it prints `[N/A]` or `[Not Supported]`. Never read as zero."""
+    try:
+        return float(x)
+    except ValueError:
+        return None
 
-    A field nvidia-smi cannot read prints as `[N/A]` and makes its line unparseable, so the line is skipped rather
-    than read as zero."""
+
+def parse_nvidia_smi(text: str) -> dict | None:
+    """The first usable `nvidia-smi --query-gpu=<_QUERY> --format=csv,noheader,nounits` line, or None.
+
+    A field nvidia-smi cannot read prints as `[N/A]` and is kept as None, never read as zero. A line is usable when
+    its UTILISATION reads. D-096: the DGX Spark's GB10 shares the system's memory and reports GPU memory as `[N/A]`
+    on every line (the Spark's probe of 2026-11-13); the earlier rule skipped any line with an unreadable field, so on that machine
+    every reading was unavailable and the concurrency check could never call a round clean."""
     for line in text.strip().splitlines():
         parts = [x.strip() for x in line.split(",")]
         if len(parts) != 4:
             continue
-        try:
-            util, used, total, temp = (float(x) for x in parts)
-        except ValueError:
+        util, used, total, temp = (_field(x) for x in parts)
+        if util is None:
             continue
         return {"util": util, "mem_used_mib": used, "mem_total_mib": total, "temp_c": temp}
     return None
@@ -92,15 +101,20 @@ def summarise_samples(samples: list[dict]) -> dict:
     """Mean and peak utilisation and memory, peak temperature, over a list of readings."""
     if not samples:
         return {"available": False, "n": 0}
+    mem = [s["mem_used_mib"] for s in samples if s["mem_used_mib"] is not None]
+    totals = [s["mem_total_mib"] for s in samples if s["mem_total_mib"] is not None]
+    temps = [s["temp_c"] for s in samples if s["temp_c"] is not None]
     return {
         "available": True,
         "n": len(samples),
         "util_mean": statistics.fmean(s["util"] for s in samples),
         "util_max": max(s["util"] for s in samples),
-        "mem_used_mib_mean": statistics.fmean(s["mem_used_mib"] for s in samples),
-        "mem_used_mib_max": max(s["mem_used_mib"] for s in samples),
-        "mem_total_mib": samples[0]["mem_total_mib"],
-        "temp_c_max": max(s["temp_c"] for s in samples),
+        # None, not zero, where the GPU reports no memory (D-096). Every sample or none: a GPU that reports memory
+        # on some readings only is treated as reporting it, from the readings that have it.
+        "mem_used_mib_mean": statistics.fmean(mem) if mem else None,
+        "mem_used_mib_max": max(mem) if mem else None,
+        "mem_total_mib": totals[0] if totals else None,
+        "temp_c_max": max(temps) if temps else None,
     }
 
 
@@ -126,15 +140,19 @@ def is_clean(bg: dict, reference: dict) -> tuple[bool, str]:
     if not bg.get("available") or not reference.get("available"):
         return False, "no GPU reading, so the background load is unknown"
     du = abs(bg["util_mean"] - reference["util_mean"])
-    dm = abs(bg["mem_used_mib_mean"] - reference["mem_used_mib_mean"]) / 1024.0
     reasons = []
     if du > CLEAN_UTIL_MARGIN:
         reasons.append(
             f"background utilisation {bg['util_mean']:.0f} percent against {reference['util_mean']:.0f}"
         )
-    if dm > CLEAN_MEM_MARGIN_GIB:
-        reasons.append(f"background memory moved by {dm:.2f} GiB")
-    return (not reasons), ("; ".join(reasons) or "background load matches the reference")
+    if bg.get("mem_used_mib_mean") is not None and reference.get("mem_used_mib_mean") is not None:
+        dm = abs(bg["mem_used_mib_mean"] - reference["mem_used_mib_mean"]) / 1024.0
+        if dm > CLEAN_MEM_MARGIN_GIB:
+            reasons.append(f"background memory moved by {dm:.2f} GiB")
+        ok_text = "background load matches the reference"
+    else:
+        ok_text = "background utilisation matches the reference (this GPU reports no memory, D-096)"
+    return (not reasons), ("; ".join(reasons) or ok_text)
 
 
 def round_clean(before: dict, after: dict, reference: dict) -> tuple[bool, str]:

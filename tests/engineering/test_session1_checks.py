@@ -436,3 +436,47 @@ def test_the_concurrency_driver_runs_end_to_end_at_smoke_size(tmp_path):
     assert m["simulated"] and m["cards"] == 2 and m["workers"] == 2 * m["per_card"] and m["identical"] is True
     p = s["projection"]
     assert p is not None and p["s4_generation_equivalents"] > 0 and "--gpus=2" in p["command"]
+
+
+# D-096: the DGX Spark's GB10 reports GPU memory as [N/A] (unified memory, the Spark's probe of 2026-11-13).
+_SPARK_LINE = "9, [N/A], [N/A], 36"
+
+
+def test_a_gpu_that_reports_no_memory_still_gives_a_reading():
+    r = s1.parse_nvidia_smi(_SPARK_LINE)
+    assert r == {"util": 9.0, "mem_used_mib": None, "mem_total_mib": None, "temp_c": 36.0}
+    assert s1.parse_nvidia_smi("[N/A], 100, 200, 36") is None  # no utilisation: not a usable reading
+    assert s1.parse_nvidia_smi_all(_SPARK_LINE + "\n" + "5, 10, 20, 30") == [
+        r,
+        {"util": 5.0, "mem_used_mib": 10.0, "mem_total_mib": 20.0, "temp_c": 30.0},
+    ]
+
+
+def test_without_memory_cleanliness_is_judged_on_utilisation_alone():
+    quiet = s1.summarise_samples([s1.parse_nvidia_smi(_SPARK_LINE)] * 3)
+    busy = s1.summarise_samples([s1.parse_nvidia_smi("60, [N/A], [N/A], 50")] * 3)
+    assert quiet["available"] and quiet["mem_used_mib_mean"] is None and quiet["mem_total_mib"] is None
+    ok, why = s1.is_clean(quiet, quiet)
+    assert ok and "reports no memory" in why
+    assert not s1.is_clean(busy, quiet)[0]
+
+
+def test_a_gpu_that_never_reports_memory_can_be_recommended_but_a_missing_reading_cannot():
+    h = {"n": 1, "failed": False, "identical": True, "clean": True, "throughput": 1.0, "peak_gpu_mib": None}
+    assert conc.eligible(h, None)[0]  # never reports memory: the host rule guards it
+    assert not conc.eligible(h, 46068.0)[0]  # reports memory, but this round has no peak: blocked as before
+    rec = conc.recommend([h, dict(h, n=2, throughput=1.5)], None)
+    assert rec["n"] == 1 and rec["fastest_n"] == 2
+
+
+def test_cards_without_memory_readings_are_eligible_only_if_none_of_them_reports_memory():
+    r = {
+        "failed": False,
+        "gpu": {"per_card": {"0": {"mem_used_mib_max": None}, "1": {"mem_used_mib_max": None}}},
+    }
+    assert conc.cards_eligible(r, True, None, 8.0)[0]
+    mixed = {
+        "failed": False,
+        "gpu": {"per_card": {"0": {"mem_used_mib_max": None}, "1": {"mem_used_mib_max": 900.0}}},
+    }
+    assert not conc.cards_eligible(mixed, True, 46068.0, 8.0)[0]
